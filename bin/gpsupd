@@ -1,0 +1,118 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# Copyright (c) 2010 Örjan Persson
+"""Simple updater from GPS data to Google Earth. GPS data can be read from
+GPSd or directly from a bluetooth device, where the former is recommended for
+all users except where GPSd is not available."""
+
+import logging
+import logging.handlers
+import optparse
+import os
+import sys
+import time
+
+import gpsupd
+try:
+    import gpsupd.lightblue as lb
+except ImportError:
+    lb = None
+try:
+    import gpsupd.gpsd as gpsd
+except ImportError:
+    gpsd = None
+import gpsupd.googleearth as gearth
+
+log = logging.getLogger('gpsupd')
+debug = True
+
+
+def main():
+    global debug
+    version = '%%prog %.1f' % (gpsupd.__version__,)
+    parser = optparse.OptionParser(usage='usage: %prog [options] filename', version=version)
+    parser.set_description(__doc__)
+
+    parser.add_option('-v', '--verbose', dest='verbosity', action='count', default=3, help='increase verbosity level')
+    parser.add_option('-q', '--quiet', dest='verbosity', action='store_const', const=0, help='be silent')
+    parser.add_option('-c', '--connector', default='gpsd', help='gps connector (gpsd, lightblue, bt) [%default]')
+    parser.add_option('-m', '--max-interval', default=5.0, type='float', help='maximum update interval [%default]')
+    parser.add_option('--syslog', action='store_true', default=False, help='log to syslog')
+
+    # add options for gpsd
+    group = optparse.OptionGroup(parser, 'GPSd', 'Connect to a GPS using GPSd (recommended)')
+    group.add_option('-a', '--gpsd-address', metavar='HOST[:PORT]', default='localhost', help='daemon address [%default]')
+    parser.add_option_group(group)
+
+    # add options for lightblue
+    group = optparse.OptionGroup(parser, 'Bluetooth', 'Connect to a GPS directly using bluetooth')
+    group.add_option('--bt-device', metavar='ADDRESS', action='append', default=[], help='bluetooth address')
+    group.add_option('--bt-no-checksum', dest='checksum', action='store_false', default=True, help='turn off checksum validation')
+    group.add_option('--bt-channel', metavar='CHANNEL', type='int', default=1, help='bluetooth channel')
+    parser.add_option_group(group)
+
+    opts, args = parser.parse_args()
+
+    if len(args) != 1:
+        parser.error('missing filename argument')
+
+    filename = os.path.realpath(args[0])
+
+    # setup logging
+    levels = [logging.CRITICAL, logging.ERROR, logging.WARNING,
+              logging.INFO, logging.DEBUG]
+    level = levels[min(opts.verbosity, len(levels)-1)]
+    debug = level <= logging.DEBUG
+
+    if opts.syslog:
+        facility = logging.handlers.SysLogHandler.LOG_DAEMON
+        syslog = logging.handlers.SysLogHandler(address='/dev/log', facility=facility)
+        formatter = logging.Formatter('gpsupd: %(message)s')
+        syslog.setFormatter(formatter)
+        logging.getLogger().addHandler(syslog)
+        logging.getLogger().setLevel(level)
+    else:
+        if debug:
+            logging.basicConfig(level=level, format='%(asctime)s [%(process)d] %(name)s %(levelname)s %(message)s')
+        else:
+            logging.basicConfig(level=level, format='%(message)s')
+
+    updater = gearth.GoogleEarthUpdater(filename)
+
+    if opts.connector == 'gpsd':
+        if gpsd is None:
+            raise ValueError('Failed to find gpsd python bindings')
+        connectors = [gpsd.GpsdConnector(opts.gpsd_address, debug)]
+    elif opts.connector in ['lightblue', 'bt']:
+        if lb is None:
+            raise ValueError('Failed to find lightblue python library')
+
+        if not opts.bt_device:
+            opts.bt_device = lb.select_devices()
+
+        if not opts.bt_device:
+            raise ValueError('No GPS devices found')
+
+        connectors = []
+        for address in set(opts.bt_device):
+            conn = lb.LightblueConnector(address, opts.bt_channel, opts.checksum, debug)
+            connectors.append(conn)
+    else:
+        parser.error('unknown gps connector')
+
+    t = 0
+    for conn in connectors:
+        for longitude, latitude, altitude, speed in conn.get_positions():
+            t2 = time.time()
+            if t2 - t >= opts.max_interval:
+                updater.callback(longitude, latitude, altitude, speed)
+                t = t2
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(0)
+    except Exception, exc:
+        log.error('%s: %s', exc.__class__.__name__, exc, exc_info=debug)
